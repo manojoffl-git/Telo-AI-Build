@@ -11,21 +11,21 @@ import 'package:sqflite/sqflite.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const QwenApp());
+  runApp(const TeloApp());
 }
 
 // ============================================================
 // APP
 // ============================================================
 
-class QwenApp extends StatefulWidget {
-  const QwenApp({super.key});
+class TeloApp extends StatefulWidget {
+  const TeloApp({super.key});
 
   @override
-  State<QwenApp> createState() => _QwenAppState();
+  State<TeloApp> createState() => _TeloAppState();
 }
 
-class _QwenAppState extends State<QwenApp> {
+class _TeloAppState extends State<TeloApp> {
   ThemeMode themeMode = ThemeMode.dark;
 
   @override
@@ -69,7 +69,7 @@ class _QwenAppState extends State<QwenApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Qwen',
+      title: 'Telo',
       themeMode: themeMode,
 
       // ========================================================
@@ -219,6 +219,9 @@ class _ChatPageState extends State<ChatPage> {
 
   String spokenText = '';
 
+  final ScrollController scrollController =
+      ScrollController();
+
   // ==========================================================
   // COLORS
   // ==========================================================
@@ -246,6 +249,7 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> initializeVoice() async {
     speechReady = await speech.initialize(
+      debugLogging: true,
       onStatus: (status) {
         if (!mounted) return;
 
@@ -261,6 +265,14 @@ class _ChatPageState extends State<ChatPage> {
         setState(() {
           listening = false;
         });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Microphone or speech recognition is unavailable. Check app permissions.',
+            ),
+          ),
+        );
       },
     );
 
@@ -275,7 +287,16 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> toggleListening() async {
     if (!speechReady) {
-      await initializeVoice();
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Voice input is unavailable. Allow microphone access and try again.',
+          ),
+        ),
+      );
+      return;
     }
 
     if (listening) {
@@ -316,9 +337,21 @@ class _ChatPageState extends State<ChatPage> {
 
     if (!mounted) return;
 
+    final started = speech.isListening;
+
     setState(() {
-      listening = true;
+      listening = started;
     });
+
+    if (!started) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not start voice input. Check microphone permission.',
+          ),
+        ),
+      );
+    }
   }
 
   Future<void> speakAnswer(String text) async {
@@ -440,16 +473,10 @@ class _ChatPageState extends State<ChatPage> {
 
     await loadChats();
 
-    if (chats.isEmpty) {
-      await createNewChat(
-        closeDrawer: false,
-      );
-    } else {
-      chatId =
-          chats.first['id'].toString();
-
-      await loadMessages();
-    }
+    // Start every app launch on a clean New Chat screen.
+    // Existing chats stay safely stored in SQLite.
+    chatId = '';
+    messages = [];
 
     if (!mounted) return;
 
@@ -492,6 +519,20 @@ class _ChatPageState extends State<ChatPage> {
         result,
       );
     });
+
+    scrollToBottom();
+  }
+
+  void scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !scrollController.hasClients) return;
+
+      scrollController.animateTo(
+        scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    });
   }
 
   Future<void> saveMessage(
@@ -517,30 +558,15 @@ class _ChatPageState extends State<ChatPage> {
   }) async {
     if (db == null) return;
 
-    final newId =
-        DateTime.now()
-            .microsecondsSinceEpoch
-            .toString();
-
-    await db!.insert(
-      'chats',
-      {
-        'id': newId,
-        'title': 'New Chat',
-        'created_at':
-            DateTime.now()
-                .millisecondsSinceEpoch,
-      },
-    );
-
+    // A new chat is only a draft until the first message is sent.
+    // This prevents empty chats from being created on every launch.
     if (!mounted) return;
 
     setState(() {
-      chatId = newId;
+      chatId = '';
       messages = [];
+      controller.clear();
     });
-
-    await loadChats();
 
     if (closeDrawer) {
       Navigator.of(context).maybePop();
@@ -575,64 +601,35 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> renameChat(
     Map<String, dynamic> chat,
   ) async {
-    final renameController =
-        TextEditingController(
-      text: chat['title']?.toString() ??
-          'New Chat',
+    final renameController = TextEditingController(
+      text: chat['title']?.toString() ?? 'New Chat',
     );
 
-    await showDialog(
+    final title = await showDialog<String>(
       context: context,
-      builder: (context) {
+      builder: (dialogContext) {
         return AlertDialog(
-          title: const Text(
-            'Rename chat',
-          ),
+          title: const Text('Rename chat'),
           content: TextField(
             controller: renameController,
             autofocus: true,
-            decoration:
-                const InputDecoration(
+            decoration: const InputDecoration(
               hintText: 'Chat name',
             ),
           ),
           actions: [
             TextButton(
-              onPressed: () =>
-                  Navigator.pop(context),
-              child: const Text(
-                'Cancel',
-              ),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
             ),
             FilledButton(
-              onPressed: () async {
-                final title =
-                    renameController
-                        .text
-                        .trim();
-
-                if (title.isNotEmpty) {
-                  await db!.update(
-                    'chats',
-                    {
-                      'title': title,
-                    },
-                    where: 'id = ?',
-                    whereArgs: [
-                      chat['id'],
-                    ],
-                  );
-
-                  await loadChats();
-                }
-
-                if (context.mounted) {
-                  Navigator.pop(context);
+              onPressed: () {
+                final value = renameController.text.trim();
+                if (value.isNotEmpty) {
+                  Navigator.pop(dialogContext, value);
                 }
               },
-              child: const Text(
-                'Save',
-              ),
+              child: const Text('Save'),
             ),
           ],
         );
@@ -640,6 +637,18 @@ class _ChatPageState extends State<ChatPage> {
     );
 
     renameController.dispose();
+
+    // The dialog is fully closed before touching the parent widget.
+    if (title == null || title.isEmpty || db == null) return;
+
+    await db!.update(
+      'chats',
+      {'title': title},
+      where: 'id = ?',
+      whereArgs: [chat['id']],
+    );
+
+    await loadChats();
   }
 
   // ==========================================================
@@ -705,18 +714,10 @@ class _ChatPageState extends State<ChatPage> {
 
     await loadChats();
 
-    if (chats.isEmpty) {
-      await createNewChat(
-        closeDrawer: false,
-      );
-      return;
-    }
-
     if (id == chatId) {
-      chatId =
-          chats.first['id'].toString();
-
-      await loadMessages();
+      // Return to a clean draft instead of automatically opening another chat.
+      chatId = '';
+      messages = [];
     }
 
     if (!mounted) return;
@@ -728,27 +729,47 @@ class _ChatPageState extends State<ChatPage> {
   // UPDATE TITLE FROM FIRST MESSAGE
   // ==========================================================
 
-  Future<void> updateChatTitle(
-    String firstMessage,
-  ) async {
-    if (db == null) return;
+  String generateChatTitle(String message) {
+    final clean = message
+        .replaceAll(RegExp(r'https?://\S+'), '')
+        .replaceAll(RegExp(r'[`*_#>\[\]{}]'), '')
+        .replaceAll(RegExp(r'[^a-zA-Z0-9+#.\- ]'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
 
-    String title =
-        firstMessage.trim();
+    if (clean.isEmpty) return 'New Chat';
 
-    if (title.length > 32) {
-      title =
-          '${title.substring(0, 32)}...';
-    }
+    final words = clean.split(' ');
+    const stopWords = {
+      'a', 'an', 'and', 'are', 'can', 'could', 'do', 'does',
+      'for', 'give', 'help', 'how', 'i', 'in', 'is', 'it', 'me',
+      'my', 'of', 'on', 'please', 'show', 'tell', 'that', 'the',
+      'this', 'to', 'want', 'what', 'with', 'would', 'you',
+    };
 
-    await db!.update(
-      'chats',
-      {
-        'title': title,
-      },
-      where: 'id = ?',
-      whereArgs: [chatId],
-    );
+    final useful = words
+        .where((word) => !stopWords.contains(word.toLowerCase()))
+        .take(4)
+        .toList();
+
+    final chosen = useful.isNotEmpty ? useful : words.take(4).toList();
+
+    return chosen.map((word) {
+      if (word.isEmpty) return word;
+      return word[0].toUpperCase() + word.substring(1);
+    }).join(' ');
+  }
+
+  Future<void> createChatFromFirstMessage(String firstMessage) async {
+    if (db == null || chatId.isNotEmpty) return;
+
+    chatId = DateTime.now().microsecondsSinceEpoch.toString();
+
+    await db!.insert('chats', {
+      'id': chatId,
+      'title': generateChatTitle(firstMessage),
+      'created_at': DateTime.now().millisecondsSinceEpoch,
+    });
 
     await loadChats();
   }
@@ -773,6 +794,13 @@ class _ChatPageState extends State<ChatPage> {
 
     controller.clear();
 
+    final firstMessage = messages.isEmpty;
+
+    // Create the SQLite chat only when the first message actually exists.
+    if (firstMessage) {
+      await createChatFromFirstMessage(text);
+    }
+
     // IMPORTANT:
     // History does NOT contain the new message.
     final historyForServer = messages.map((message) {
@@ -781,8 +809,6 @@ class _ChatPageState extends State<ChatPage> {
         'content': message['content'],
       };
     }).toList();
-
-    final firstMessage = messages.isEmpty;
 
     setState(() {
       loading = true;
@@ -798,11 +824,9 @@ class _ChatPageState extends State<ChatPage> {
       });
     });
 
-    await saveMessage('user', text);
+    scrollToBottom();
 
-    if (firstMessage) {
-      await updateChatTitle(text);
-    }
+    await saveMessage('user', text);
 
     final client = http.Client();
 
@@ -851,6 +875,8 @@ class _ChatPageState extends State<ChatPage> {
               messages[messages.length - 1]['content'] =
                   fullAnswer;
             });
+
+            scrollToBottom();
           }
         } catch (_) {
           // Ignore malformed stream chunks.
@@ -863,7 +889,7 @@ class _ChatPageState extends State<ChatPage> {
 
       setState(() {
         messages[messages.length - 1]['content'] =
-            'I couldn\'t connect to Qwen.\n\n'
+            'I couldn\'t connect to Telo.\n\n'
             'Make sure your Kaggle server is running '
             'and your API URL is still valid.';
       });
@@ -912,7 +938,7 @@ class _ChatPageState extends State<ChatPage> {
             children: [
               Row(
                 children: [
-                  QwenLogo(
+                  TeloLogo(
                     size: 46,
                     color: accent,
                   ),
@@ -1160,7 +1186,7 @@ class _ChatPageState extends State<ChatPage> {
               ),
               child: Row(
                 children: [
-                  QwenLogo(
+                  TeloLogo(
                     size: 48,
                     color: accent,
                   ),
@@ -1174,7 +1200,7 @@ class _ChatPageState extends State<ChatPage> {
                               .start,
                       children: [
                         Text(
-                          'Qwen',
+                          'Telo',
                           style: TextStyle(
                             fontSize: 21,
                             fontWeight:
@@ -1501,7 +1527,7 @@ class _ChatPageState extends State<ChatPage> {
           mainAxisAlignment:
               MainAxisAlignment.center,
           children: [
-            QwenLogo(
+            TeloLogo(
               size: 82,
               color: accent,
             ),
@@ -1524,7 +1550,7 @@ class _ChatPageState extends State<ChatPage> {
             ),
 
             Text(
-              'Ask Qwen anything.',
+              'Ask Telo anything.',
               style: TextStyle(
                 color: Theme.of(
                   context,
@@ -1549,7 +1575,7 @@ class _ChatPageState extends State<ChatPage> {
                   color: accent,
                 ),
                 label: const Text(
-                  'Connect to Qwen',
+                  'Connect to Telo',
                 ),
               ),
           ],
@@ -1564,6 +1590,7 @@ class _ChatPageState extends State<ChatPage> {
 
   Widget buildMessages() {
     return ListView.builder(
+      controller: scrollController,
       padding:
           const EdgeInsets.fromLTRB(
         16,
@@ -1634,7 +1661,7 @@ class _ChatPageState extends State<ChatPage> {
                 decoration:
                     InputDecoration(
                   hintText:
-                      'Message Qwen...',
+                      'Message Telo...',
                   prefixIcon: IconButton(
                     tooltip: listening
                         ? 'Stop listening'
@@ -1708,7 +1735,7 @@ class _ChatPageState extends State<ChatPage> {
 
         title: Row(
           children: [
-            QwenLogo(
+            TeloLogo(
               size: 34,
               color: accent,
             ),
@@ -1723,7 +1750,7 @@ class _ChatPageState extends State<ChatPage> {
                       .start,
               children: [
                 const Text(
-                  'Qwen',
+                  'Telo',
                   style: TextStyle(
                     fontSize: 18,
                     fontWeight:
@@ -1801,7 +1828,7 @@ class _ChatPageState extends State<ChatPage> {
                   ),
                   const Expanded(
                     child: Text(
-                      'Connect your Qwen server to start chatting.',
+                      'Connect your Telo server to start chatting.',
                       style: TextStyle(
                         fontSize: 12,
                       ),
@@ -1843,6 +1870,7 @@ class _ChatPageState extends State<ChatPage> {
 
     controller.dispose();
     apiController.dispose();
+    scrollController.dispose();
     db?.close();
 
     super.dispose();
@@ -1941,7 +1969,7 @@ class MessageBubble extends StatelessWidget {
           crossAxisAlignment:
               CrossAxisAlignment.start,
           children: [
-            QwenLogo(
+            TeloLogo(
               size: 28,
               color: accent,
             ),
@@ -2026,11 +2054,11 @@ class MessageBubble extends StatelessWidget {
 // QWEN LOGO
 // ============================================================
 
-class QwenLogo extends StatelessWidget {
+class TeloLogo extends StatelessWidget {
   final double size;
   final Color color;
 
-  const QwenLogo({
+  const TeloLogo({
     super.key,
     this.size = 60,
     required this.color,
@@ -2050,13 +2078,13 @@ class QwenLogo extends StatelessWidget {
         ),
       ),
       child: CustomPaint(
-        painter: QwenLogoPainter(),
+        painter: TeloLogoPainter(),
       ),
     );
   }
 }
 
-class QwenLogoPainter
+class TeloLogoPainter
     extends CustomPainter {
   @override
   void paint(
