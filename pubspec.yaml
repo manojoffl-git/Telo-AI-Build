@@ -38,6 +38,9 @@ dependencies:
   sqflite: ^2.4.3
   path: ^1.9.1
   shared_preferences: ^2.5.5
+  speech_to_text: ^7.4.0
+  flutter_tts: ^4.2.5
+  flutter_markdown_plus: ^1.0.12
 
 dev_dependencies:
   flutter_test:
