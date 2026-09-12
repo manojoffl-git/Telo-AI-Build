@@ -1,6 +1,9 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -204,6 +207,19 @@ class _ChatPageState extends State<ChatPage> {
   bool databaseReady = false;
 
   // ==========================================================
+  // VOICE
+  // ==========================================================
+
+  final stt.SpeechToText speech = stt.SpeechToText();
+  final FlutterTts tts = FlutterTts();
+
+  bool speechReady = false;
+  bool listening = false;
+  bool speaking = false;
+
+  String spokenText = '';
+
+  // ==========================================================
   // COLORS
   // ==========================================================
 
@@ -220,11 +236,123 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     initializeApp();
+    initializeVoice();
   }
 
   Future<void> initializeApp() async {
     await loadApiUrl();
     await initDatabase();
+  }
+
+  Future<void> initializeVoice() async {
+    speechReady = await speech.initialize(
+      onStatus: (status) {
+        if (!mounted) return;
+
+        if (status == 'done' || status == 'notListening') {
+          setState(() {
+            listening = false;
+          });
+        }
+      },
+      onError: (error) {
+        if (!mounted) return;
+
+        setState(() {
+          listening = false;
+        });
+      },
+    );
+
+    await tts.setSpeechRate(0.48);
+    await tts.setPitch(1.0);
+    await tts.setVolume(1.0);
+    await tts.setLanguage('en-US');
+
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  Future<void> toggleListening() async {
+    if (!speechReady) {
+      await initializeVoice();
+    }
+
+    if (listening) {
+      await speech.stop();
+
+      if (spokenText.trim().isNotEmpty) {
+        controller.text = spokenText.trim();
+        controller.selection = TextSelection.fromPosition(
+          TextPosition(offset: controller.text.length),
+        );
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        listening = false;
+      });
+
+      return;
+    }
+
+    spokenText = '';
+
+    await speech.listen(
+      onResult: (result) {
+        if (!mounted) return;
+
+        setState(() {
+          spokenText = result.recognizedWords;
+          controller.text = result.recognizedWords;
+          controller.selection = TextSelection.fromPosition(
+            TextPosition(offset: controller.text.length),
+          );
+        });
+      },
+      partialResults: true,
+    );
+
+    if (!mounted) return;
+
+    setState(() {
+      listening = true;
+    });
+  }
+
+  Future<void> speakAnswer(String text) async {
+    if (text.trim().isEmpty) return;
+
+    await tts.stop();
+
+    if (!mounted) return;
+
+    setState(() {
+      speaking = true;
+    });
+
+    await tts.speak(
+      text
+          .replaceAll(RegExp(r'```[\s\S]*?```'), '')
+          .replaceAll(RegExp(r'[*_#>`]'), ''),
+    );
+
+    if (!mounted) return;
+
+    setState(() {
+      speaking = false;
+    });
+  }
+
+  Future<void> stopSpeaking() async {
+    await tts.stop();
+
+    if (!mounted) return;
+
+    setState(() {
+      speaking = false;
+    });
   }
 
   // ==========================================================
@@ -630,8 +758,7 @@ class _ChatPageState extends State<ChatPage> {
   // ==========================================================
 
   Future<void> sendMessage() async {
-    final text =
-        controller.text.trim();
+    final text = controller.text.trim();
 
     if (text.isEmpty) return;
     if (loading) return;
@@ -642,21 +769,20 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
 
+    await stopSpeaking();
+
     controller.clear();
 
     // IMPORTANT:
     // History does NOT contain the new message.
-    final historyForServer =
-        messages.map((message) {
+    final historyForServer = messages.map((message) {
       return {
         'role': message['role'],
-        'content':
-            message['content'],
+        'content': message['content'],
       };
     }).toList();
 
-    final firstMessage =
-        messages.isEmpty;
+    final firstMessage = messages.isEmpty;
 
     setState(() {
       loading = true;
@@ -665,85 +791,84 @@ class _ChatPageState extends State<ChatPage> {
         'role': 'user',
         'content': text,
       });
+
+      messages.add({
+        'role': 'assistant',
+        'content': '',
+      });
     });
 
-    await saveMessage(
-      'user',
-      text,
-    );
+    await saveMessage('user', text);
 
     if (firstMessage) {
       await updateChatTitle(text);
     }
 
+    final client = http.Client();
+
     try {
-      final result = await http
-          .post(
-            Uri.parse(
-              '$apiUrl/chat',
-            ),
-            headers: {
-              'Content-Type':
-                  'application/json',
-            },
-            body: jsonEncode({
-              'chat_id': chatId,
-              'message': text,
-              'history':
-                  historyForServer,
-            }),
-          )
-          .timeout(
-        const Duration(
-          minutes: 5,
-        ),
+      final request = http.Request(
+        'POST',
+        Uri.parse('$apiUrl/chat/stream'),
       );
 
-      if (result.statusCode == 200) {
-        final data =
-            jsonDecode(result.body);
+      request.headers['Content-Type'] = 'application/json';
 
-        final answer =
-            data['response']
-                    ?.toString() ??
-                '';
+      request.body = jsonEncode({
+        'chat_id': chatId,
+        'message': text,
+        'history': historyForServer,
+      });
 
-        await saveMessage(
-          'assistant',
-          answer,
+      final streamed = await client.send(request);
+
+      if (streamed.statusCode != 200) {
+        throw Exception(
+          'Server error: ${streamed.statusCode}',
         );
-
-        if (!mounted) return;
-
-        setState(() {
-          messages.add({
-            'role': 'assistant',
-            'content': answer,
-          });
-        });
-      } else {
-        if (!mounted) return;
-
-        setState(() {
-          messages.add({
-            'role': 'assistant',
-            'content':
-                'Server error: ${result.statusCode}',
-          });
-        });
       }
+
+      String fullAnswer = '';
+
+      await for (final chunk in streamed.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())) {
+        if (chunk.trim().isEmpty) {
+          continue;
+        }
+
+        try {
+          final data = jsonDecode(chunk);
+
+          if (data['content'] != null) {
+            final piece = data['content'].toString();
+
+            fullAnswer += piece;
+
+            if (!mounted) return;
+
+            setState(() {
+              messages[messages.length - 1]['content'] =
+                  fullAnswer;
+            });
+          }
+        } catch (_) {
+          // Ignore malformed stream chunks.
+        }
+      }
+
+      await saveMessage('assistant', fullAnswer);
     } catch (e) {
       if (!mounted) return;
 
       setState(() {
-        messages.add({
-          'role': 'assistant',
-          'content':
-              'I couldn\'t connect to Qwen.\n\n'
-              'Make sure your Kaggle server is running '
-              'and the API URL is still valid.',
-        });
+        messages[messages.length - 1]['content'] =
+            'I couldn\'t connect to Qwen.\n\n'
+            'Make sure your Kaggle server is running '
+            'and your API URL is still valid.';
       });
+    } finally {
+      client.close();
     }
 
     if (!mounted) return;
@@ -1460,6 +1585,13 @@ class _ChatPageState extends State<ChatPage> {
           isUser:
               message['role'] ==
                   'user',
+          speaking: !message['content'].toString().trim().isEmpty &&
+              index == messages.length - 1 &&
+              speaking,
+          onSpeak: () => speakAnswer(
+            message['content'].toString(),
+          ),
+          onStopSpeaking: stopSpeaking,
         );
       },
     );
@@ -1503,6 +1635,23 @@ class _ChatPageState extends State<ChatPage> {
                     InputDecoration(
                   hintText:
                       'Message Qwen...',
+                  prefixIcon: IconButton(
+                    tooltip: listening
+                        ? 'Stop listening'
+                        : 'Voice input',
+                    onPressed:
+                        loading
+                            ? null
+                            : toggleListening,
+                    icon: Icon(
+                      listening
+                          ? Icons.stop_rounded
+                          : Icons.mic_none_rounded,
+                      color: listening
+                          ? accent
+                          : null,
+                    ),
+                  ),
                   suffixIcon:
                       controller.text
                               .isNotEmpty
@@ -1689,6 +1838,9 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    speech.stop();
+    tts.stop();
+
     controller.dispose();
     apiController.dispose();
     db?.close();
@@ -1704,11 +1856,17 @@ class _ChatPageState extends State<ChatPage> {
 class MessageBubble extends StatelessWidget {
   final String message;
   final bool isUser;
+  final bool speaking;
+  final VoidCallback? onSpeak;
+  final VoidCallback? onStopSpeaking;
 
   const MessageBubble({
     super.key,
     required this.message,
     required this.isUser,
+    this.speaking = false,
+    this.onSpeak,
+    this.onStopSpeaking,
   });
 
   @override
@@ -1793,19 +1951,68 @@ class MessageBubble extends StatelessWidget {
             ),
 
             Expanded(
-              child: Text(
-                message,
-                style: TextStyle(
-                  color: isDark
-                      ? const Color(
-                          0xFFE8E6DE,
-                        )
-                      : const Color(
-                          0xFF24231F,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  MarkdownBody(
+                    data: message,
+                    selectable: true,
+                    styleSheet:
+                        MarkdownStyleSheet.fromTheme(
+                      Theme.of(context),
+                    ).copyWith(
+                      p: TextStyle(
+                        color: isDark
+                            ? const Color(0xFFE8E6DE)
+                            : const Color(0xFF24231F),
+                        fontSize: 15.5,
+                        height: 1.5,
+                      ),
+                      h1: const TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      h2: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      h3: const TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      code: TextStyle(
+                        fontFamily: 'monospace',
+                        backgroundColor:
+                            Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: 0.08),
+                      ),
+                    ),
+                  ),
+                  if (message.trim().isNotEmpty)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: IconButton(
+                        tooltip:
+                            speaking ? 'Stop' : 'Read aloud',
+                        icon: Icon(
+                          speaking
+                              ? Icons.stop_circle_outlined
+                              : Icons.volume_up_outlined,
+                          size: 19,
                         ),
-                  fontSize: 15.5,
-                  height: 1.5,
-                ),
+                        onPressed: speaking
+                            ? onStopSpeaking
+                            : onSpeak,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 34,
+                          minHeight: 34,
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
           ],
