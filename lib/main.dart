@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
@@ -6,6 +8,9 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart';
 
@@ -1789,6 +1794,22 @@ class _ChatPageState extends State<ChatPage> {
 
         actions: [
           IconButton(
+            tooltip: 'Voice Chat',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => VoiceChatPage(
+                    apiUrl: apiUrl,
+                  ),
+                ),
+              );
+            },
+            icon: const Icon(
+              Icons.graphic_eq_rounded,
+            ),
+          ),
+
+          IconButton(
             tooltip: 'New chat',
             onPressed:
                 databaseReady
@@ -1882,6 +1903,616 @@ class _ChatPageState extends State<ChatPage> {
     super.dispose();
   }
 }
+
+class VoiceChatPage extends StatefulWidget {
+  final String apiUrl;
+
+  const VoiceChatPage({
+    super.key,
+    required this.apiUrl,
+  });
+
+  @override
+  State<VoiceChatPage> createState() => _VoiceChatPageState();
+}
+
+class _VoiceChatPageState extends State<VoiceChatPage> {
+  final AudioRecorder recorder = AudioRecorder();
+  final AudioPlayer player = AudioPlayer();
+
+  final List<Map<String, String>> voiceMessages = [];
+
+  bool recording = false;
+  bool processing = false;
+  bool speaking = false;
+
+  String? recordingPath;
+  String? audioPath;
+  String statusText = 'Tap the microphone to talk';
+
+  Color get accent => Theme.of(context).colorScheme.primary;
+
+  bool get isDark =>
+      Theme.of(context).brightness == Brightness.dark;
+
+  StreamSubscription<PlayerState>? playerStateSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+
+    playerStateSubscription = player.playerStateStream.listen((state) async {
+      if (state.processingState == ProcessingState.completed) {
+        await cleanupAudioFile();
+
+        if (!mounted) return;
+
+        setState(() {
+          speaking = false;
+          statusText = 'Tap the microphone to talk';
+        });
+      }
+    });
+  }
+
+  Future<void> toggleRecording() async {
+    if (processing || speaking) return;
+
+    if (recording) {
+      await stopRecording();
+      return;
+    }
+
+    await startRecording();
+  }
+
+  Future<void> startRecording() async {
+    if (widget.apiUrl.trim().isEmpty) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Connect your Telo server in Settings first.'),
+        ),
+      );
+      return;
+    }
+
+    try {
+      final hasPermission = await recorder.hasPermission();
+
+      if (!hasPermission) {
+        if (!mounted) return;
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Microphone permission is required for Voice Chat.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      final directory = await getTemporaryDirectory();
+
+      final path =
+          p.join(
+            directory.path,
+            'telo_voice_${DateTime.now().millisecondsSinceEpoch}.m4a',
+          );
+
+      await recorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          bitRate: 128000,
+          sampleRate: 44100,
+        ),
+        path: path,
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        recording = true;
+        recordingPath = path;
+        statusText = 'Listening...';
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        recording = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Could not start Voice Chat: $e'),
+        ),
+      );
+    }
+  }
+
+  Future<void> stopRecording() async {
+    try {
+      final path = await recorder.stop();
+
+      if (!mounted) return;
+
+      setState(() {
+        recording = false;
+        processing = true;
+        statusText = 'Transcribing...';
+        recordingPath = path ?? recordingPath;
+      });
+
+      final actualPath = path ?? recordingPath;
+
+      if (actualPath == null) {
+        throw Exception('No recording was created.');
+      }
+
+      await processVoiceMessage(actualPath);
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        recording = false;
+        processing = false;
+        statusText = 'Tap the microphone to talk';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Voice Chat failed: $e'),
+        ),
+      );
+    }
+  }
+
+  Future<String> transcribe(String filePath) async {
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('${widget.apiUrl}/voice/transcribe'),
+    );
+
+    request.files.add(
+      await http.MultipartFile.fromPath(
+        'file',
+        filePath,
+      ),
+    );
+
+    final response = await request.send();
+    final body = await response.stream.bytesToString();
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Transcription server error: ${response.statusCode}',
+      );
+    }
+
+    final data = jsonDecode(body);
+
+    final transcript = data['text']?.toString().trim() ?? '';
+
+    if (transcript.isEmpty) {
+      throw Exception('I could not hear anything.');
+    }
+
+    return transcript;
+  }
+
+  Future<String> askVoiceAI(String message) async {
+    final response = await http.post(
+      Uri.parse('${widget.apiUrl}/voice/chat'),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'message': message,
+        'history': voiceMessages
+            .map(
+              (item) => {
+                'role': item['role'],
+                'content': item['content'],
+              },
+            )
+            .toList(),
+      }),
+    );
+
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Voice AI server error: ${response.statusCode}',
+      );
+    }
+
+    final data = jsonDecode(response.body);
+
+    final answer = data['response']?.toString().trim() ?? '';
+
+    if (answer.isEmpty) {
+      throw Exception('Telo returned an empty response.');
+    }
+
+    return answer;
+  }
+
+  Future<void> speak(String text) async {
+    await player.stop();
+    await cleanupAudioFile();
+
+    final response = await http.post(
+      Uri.parse('${widget.apiUrl}/voice/speak'),
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'text': text,
+      }),
+    );
+
+    if (response.statusCode != 200) {
+      String errorMessage =
+          'TTS server error: ${response.statusCode}';
+
+      if (response.body.isNotEmpty) {
+        errorMessage =
+            'TTS server error: ${response.statusCode}\n${response.body}';
+      }
+
+      throw Exception(errorMessage);
+    }
+
+    if (response.bodyBytes.isEmpty) {
+      throw Exception('TTS returned empty audio.');
+    }
+
+    final directory = await getTemporaryDirectory();
+    final path = p.join(
+      directory.path,
+      'telo_tts_${DateTime.now().millisecondsSinceEpoch}.wav',
+    );
+
+    final file = File(path);
+    await file.writeAsBytes(response.bodyBytes, flush: true);
+
+    if (!await file.exists()) {
+      throw Exception('Could not create TTS audio file.');
+    }
+
+    if (await file.length() == 0) {
+      throw Exception('TTS audio file is empty.');
+    }
+
+    audioPath = path;
+
+    if (!mounted) return;
+
+    setState(() {
+      speaking = true;
+      statusText = 'Telo is speaking...';
+    });
+
+    try {
+      await player.setFilePath(path);
+      await player.play();
+    } catch (e) {
+      await cleanupAudioFile();
+
+      if (mounted) {
+        setState(() {
+          speaking = false;
+          statusText = 'Tap the microphone to talk';
+        });
+      }
+
+      throw Exception('Android audio playback failed: $e');
+    }
+  }
+
+  Future<void> cleanupAudioFile() async {
+    final path = audioPath;
+    if (path == null) return;
+
+    audioPath = null;
+
+    try {
+      final file = File(path);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> processVoiceMessage(String filePath) async {
+    try {
+      final transcript = await transcribe(filePath);
+
+      if (!mounted) return;
+
+      setState(() {
+        voiceMessages.add({
+          'role': 'user',
+          'content': transcript,
+        });
+        statusText = 'Thinking...';
+      });
+
+      final answer = await askVoiceAI(transcript);
+
+      if (!mounted) return;
+
+      setState(() {
+        voiceMessages.add({
+          'role': 'assistant',
+          'content': answer,
+        });
+        processing = false;
+      });
+
+      await speak(answer);
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        processing = false;
+        speaking = false;
+        statusText = 'Tap the microphone to talk';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Voice Chat failed: $e'),
+        ),
+      );
+    } finally {
+      try {
+        await File(filePath).delete();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> stopSpeaking() async {
+    await player.stop();
+    await cleanupAudioFile();
+
+    if (!mounted) return;
+
+    setState(() {
+      speaking = false;
+      statusText = 'Tap the microphone to talk';
+    });
+  }
+
+  Widget buildVoiceMessage(
+    Map<String, String> message,
+  ) {
+    final isUser = message['role'] == 'user';
+    final content = message['content'] ?? '';
+
+    return Align(
+      alignment:
+          isUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        constraints: const BoxConstraints(
+          maxWidth: 330,
+        ),
+        margin: const EdgeInsets.symmetric(
+          vertical: 6,
+          horizontal: 16,
+        ),
+        padding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 12,
+        ),
+        decoration: BoxDecoration(
+          color: isUser
+              ? accent
+              : Theme.of(context)
+                  .colorScheme
+                  .onSurface
+                  .withValues(alpha: 0.07),
+          borderRadius: BorderRadius.circular(19),
+        ),
+        child: Text(
+          content,
+          style: TextStyle(
+            color: isUser
+                ? Colors.black
+                : (isDark
+                    ? const Color(0xFFE8E6DE)
+                    : const Color(0xFF24231F)),
+            fontSize: 15.5,
+            height: 1.4,
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canPress =
+        !processing && !speaking;
+
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 16,
+        title: Row(
+          children: [
+            TeloLogo(
+              size: 34,
+              color: accent,
+            ),
+            const SizedBox(width: 10),
+            const Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Voice Chat',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                Text(
+                  'Talk with Telo',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: Colors.grey,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          if (speaking)
+            IconButton(
+              tooltip: 'Stop speaking',
+              onPressed: stopSpeaking,
+              icon: const Icon(
+                Icons.stop_circle_outlined,
+              ),
+            ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: voiceMessages.isEmpty
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(30),
+                      child: Column(
+                        mainAxisAlignment:
+                            MainAxisAlignment.center,
+                        children: [
+                          TeloLogo(
+                            size: 92,
+                            color: accent,
+                          ),
+                          const SizedBox(height: 25),
+                          const Text(
+                            'Talk to Telo',
+                            style: TextStyle(
+                              fontSize: 27,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          const SizedBox(height: 9),
+                          Text(
+                            'Speak naturally. Telo will listen, think, and reply.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurface
+                                  .withValues(alpha: 0.5),
+                              fontSize: 15,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.only(
+                      top: 18,
+                      bottom: 20,
+                    ),
+                    itemCount: voiceMessages.length,
+                    itemBuilder: (context, index) {
+                      return buildVoiceMessage(
+                        voiceMessages[index],
+                      );
+                    },
+                  ),
+          ),
+
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            padding: const EdgeInsets.only(
+              top: 14,
+              bottom: 28,
+            ),
+            child: Column(
+              children: [
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: Text(
+                    statusText,
+                    key: ValueKey(statusText),
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: processing || speaking || recording
+                          ? accent
+                          : Theme.of(context)
+                              .colorScheme
+                              .onSurface
+                              .withValues(alpha: 0.5),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                GestureDetector(
+                  onTap: canPress
+                      ? toggleRecording
+                      : (speaking ? stopSpeaking : null),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    width: 78,
+                    height: 78,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: recording
+                          ? accent
+                          : Theme.of(context)
+                              .colorScheme
+                              .onSurface
+                              .withValues(alpha: 0.08),
+                      border: Border.all(
+                        color: accent.withValues(
+                          alpha: recording ? 1.0 : 0.35,
+                        ),
+                        width: 2,
+                      ),
+                    ),
+                    child: Icon(
+                      recording
+                          ? Icons.stop_rounded
+                          : speaking
+                              ? Icons.stop_rounded
+                              : processing
+                                  ? Icons.hourglass_top_rounded
+                                  : Icons.mic_rounded,
+                      size: 34,
+                      color: recording
+                          ? Colors.black
+                          : accent,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    playerStateSubscription?.cancel();
+    recorder.dispose();
+    player.dispose();
+    cleanupAudioFile();
+    super.dispose();
+  }
+}
+
 
 // ============================================================
 // MESSAGE BUBBLE
@@ -2090,63 +2721,84 @@ class TeloLogo extends StatelessWidget {
   }
 }
 
-class TeloLogoPainter extends CustomPainter {
+class TeloLogoPainter
+    extends CustomPainter {
   @override
-  void paint(Canvas canvas, Size size) {
-    // Black symbol matching the Telo icon:
-    // one vertical stem, circular center ring, and two lower arms.
-    final stroke = size.width * 0.055;
-
+  void paint(
+    Canvas canvas,
+    Size size,
+  ) {
     final paint = Paint()
       ..color = Colors.black
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeJoin = StrokeJoin.round;
+      ..style =
+          PaintingStyle.stroke
+      ..strokeWidth =
+          size.width * 0.075
+      ..strokeCap =
+          StrokeCap.round;
 
-    final cx = size.width * 0.50;
-    final cy = size.height * 0.49;
-
-    // Vertical stem.
-    canvas.drawLine(
-      Offset(cx, size.height * 0.08),
-      Offset(cx, cy),
-      paint,
+    final center = Offset(
+      size.width / 2,
+      size.height / 2,
     );
 
-    // Circular ring around the center.
+    final radius =
+        size.width * 0.27;
+
+    // Outer AI ring
     canvas.drawCircle(
-      Offset(cx, cy),
-      size.width * 0.235,
+      center,
+      radius,
       paint,
     );
 
-    // Lower-left arm.
-    canvas.drawLine(
-      Offset(cx, cy + size.height * 0.02),
-      Offset(size.width * 0.10, size.height * 0.68),
-      paint,
-    );
+    // Three AI connection lines
+    final points = [
+      Offset(
+        center.dx,
+        center.dy - radius * 1.75,
+      ),
+      Offset(
+        center.dx -
+            radius * 1.52,
+        center.dy +
+            radius * 0.9,
+      ),
+      Offset(
+        center.dx +
+            radius * 1.52,
+        center.dy +
+            radius * 0.9,
+      ),
+    ];
 
-    // Lower-right arm.
-    canvas.drawLine(
-      Offset(cx, cy + size.height * 0.02),
-      Offset(size.width * 0.88, size.height * 0.68),
-      paint,
-    );
+    for (final point in points) {
+      canvas.drawLine(
+        center,
+        point,
+        paint,
+      );
+    }
 
-    // Small central node.
-    final core = Paint()
-      ..color = Colors.black
-      ..style = PaintingStyle.fill;
+    // Center core
+    final core =
+        Paint()
+          ..color =
+              Colors.black
+          ..style =
+              PaintingStyle.fill;
 
     canvas.drawCircle(
-      Offset(cx, cy),
-      size.width * 0.075,
+      center,
+      size.width * 0.09,
       core,
     );
   }
 
   @override
-  bool shouldRepaint(CustomPainter oldDelegate) => false;
+  bool shouldRepaint(
+    CustomPainter oldDelegate,
+  ) {
+    return false;
+  }
 }
