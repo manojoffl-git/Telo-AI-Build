@@ -239,17 +239,19 @@ class _ChatPageState extends State<ChatPage> {
   void initState() {
     super.initState();
     initializeApp();
-    initializeVoice();
   }
 
   Future<void> initializeApp() async {
-    await loadApiUrl();
-    await initDatabase();
+    // Load independent startup tasks together so neither waits for the other.
+    await Future.wait([
+      loadApiUrl(),
+      initDatabase(),
+    ]);
   }
 
   Future<void> initializeVoice() async {
     speechReady = await speech.initialize(
-      debugLogging: true,
+      debugLogging: false,
       onStatus: (status) {
         if (!mounted) return;
 
@@ -276,27 +278,29 @@ class _ChatPageState extends State<ChatPage> {
       },
     );
 
+    // TTS settings are applied lazily too, instead of during app startup.
     await tts.setSpeechRate(0.48);
     await tts.setPitch(1.0);
     await tts.setVolume(1.0);
     await tts.setLanguage('en-US');
-
-    if (!mounted) return;
-    setState(() {});
   }
 
   Future<void> toggleListening() async {
     if (!speechReady) {
-      if (!mounted) return;
+      await initializeVoice();
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Voice input is unavailable. Allow microphone access and try again.',
+      if (!speechReady) {
+        if (!mounted) return;
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Voice input is unavailable. Allow microphone access and try again.',
+            ),
           ),
-        ),
-      );
-      return;
+        );
+        return;
+      }
     }
 
     if (listening) {
@@ -875,6 +879,8 @@ class _ChatPageState extends State<ChatPage> {
               messages[messages.length - 1]['content'] =
                   fullAnswer;
             });
+
+            scrollToBottom();
 
             scrollToBottom();
           }
@@ -2051,7 +2057,7 @@ class MessageBubble extends StatelessWidget {
 }
 
 // ============================================================
-// QWEN LOGO
+// TELO LOGO
 // ============================================================
 
 class TeloLogo extends StatelessWidget {
@@ -2084,84 +2090,63 @@ class TeloLogo extends StatelessWidget {
   }
 }
 
-class TeloLogoPainter
-    extends CustomPainter {
+class TeloLogoPainter extends CustomPainter {
   @override
-  void paint(
-    Canvas canvas,
-    Size size,
-  ) {
+  void paint(Canvas canvas, Size size) {
+    // Black symbol matching the Telo icon:
+    // one vertical stem, circular center ring, and two lower arms.
+    final stroke = size.width * 0.055;
+
     final paint = Paint()
       ..color = Colors.black
-      ..style =
-          PaintingStyle.stroke
-      ..strokeWidth =
-          size.width * 0.075
-      ..strokeCap =
-          StrokeCap.round;
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
 
-    final center = Offset(
-      size.width / 2,
-      size.height / 2,
-    );
+    final cx = size.width * 0.50;
+    final cy = size.height * 0.49;
 
-    final radius =
-        size.width * 0.27;
-
-    // Outer AI ring
-    canvas.drawCircle(
-      center,
-      radius,
+    // Vertical stem.
+    canvas.drawLine(
+      Offset(cx, size.height * 0.08),
+      Offset(cx, cy),
       paint,
     );
 
-    // Three AI connection lines
-    final points = [
-      Offset(
-        center.dx,
-        center.dy - radius * 1.75,
-      ),
-      Offset(
-        center.dx -
-            radius * 1.52,
-        center.dy +
-            radius * 0.9,
-      ),
-      Offset(
-        center.dx +
-            radius * 1.52,
-        center.dy +
-            radius * 0.9,
-      ),
-    ];
+    // Circular ring around the center.
+    canvas.drawCircle(
+      Offset(cx, cy),
+      size.width * 0.235,
+      paint,
+    );
 
-    for (final point in points) {
-      canvas.drawLine(
-        center,
-        point,
-        paint,
-      );
-    }
+    // Lower-left arm.
+    canvas.drawLine(
+      Offset(cx, cy + size.height * 0.02),
+      Offset(size.width * 0.10, size.height * 0.68),
+      paint,
+    );
 
-    // Center core
-    final core =
-        Paint()
-          ..color =
-              Colors.black
-          ..style =
-              PaintingStyle.fill;
+    // Lower-right arm.
+    canvas.drawLine(
+      Offset(cx, cy + size.height * 0.02),
+      Offset(size.width * 0.88, size.height * 0.68),
+      paint,
+    );
+
+    // Small central node.
+    final core = Paint()
+      ..color = Colors.black
+      ..style = PaintingStyle.fill;
 
     canvas.drawCircle(
-      center,
-      size.width * 0.09,
+      Offset(cx, cy),
+      size.width * 0.075,
       core,
     );
   }
 
   @override
-  bool shouldRepaint(
-    CustomPainter oldDelegate,
-  ) {
-    return false;
-  }
+  bool shouldRepaint(CustomPainter oldDelegate) => false;
 }
